@@ -3,21 +3,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from io import StringIO
 from pathlib import Path
 from typing import Iterable
-import urllib.request
 
 import pandas as pd
+import yfinance as yf
 
 from ..config import DEFAULT_INSTRUMENT_MAP
 from ..schema import CANONICAL_BAR_COLUMNS, coerce_canonical_bar_frame
-
-
-def _read_url_text(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8")
 
 
 class BarDataSource(ABC):
@@ -29,39 +22,49 @@ class BarDataSource(ABC):
 
 
 class PublicDailySource(BarDataSource):
-    """Immediate public data source backed by Stooq daily bars."""
-
-    base_url = "https://stooq.com/q/d/l/?i=d&s={ticker}"
+    """Immediate public data source backed by Yahoo Finance daily bars."""
 
     def __init__(self, instrument_map: dict[str, dict[str, str]] | None = None) -> None:
         self.instrument_map = instrument_map or DEFAULT_INSTRUMENT_MAP
 
     def fetch(self, symbols: Iterable[str], start_date: str, end_date: str) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
+        # Yahoo's `end` parameter is exclusive, so add one day to keep the requested end date.
+        inclusive_end = (pd.Timestamp(end_date) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         for symbol in symbols:
             metadata = self.instrument_map.get(symbol)
             if metadata is None:
                 raise KeyError(f"no metadata configured for symbol {symbol}")
-            ticker = metadata["stooq_symbol"]
-            text = _read_url_text(self.base_url.format(ticker=ticker))
-            frame = pd.read_csv(StringIO(text))
+            ticker = metadata.get("yahoo_symbol", symbol)
+            frame = yf.download(
+                tickers=ticker,
+                start=start_date,
+                end=inclusive_end,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
             if frame.empty:
                 raise ValueError(f"no rows returned for symbol {symbol}")
-            frame = frame.rename(
+            if isinstance(frame.columns, pd.MultiIndex):
+                frame.columns = frame.columns.get_level_values(0)
+            frame = frame.reset_index().rename(
                 columns={
                     "Date": "date",
                     "Open": "open",
                     "High": "high",
                     "Low": "low",
                     "Close": "close",
+                    "Adj Close": "adj_close",
                     "Volume": "volume",
                 }
             )
             frame["symbol"] = symbol
             frame["asset_class"] = metadata["asset_class"]
             frame["currency"] = metadata["currency"]
-            frame["adj_close"] = frame["close"]
-            frame["source"] = "public_daily:stooq"
+            if "adj_close" not in frame.columns:
+                frame["adj_close"] = frame["close"]
+            frame["source"] = "public_daily:yfinance"
             frame = frame.loc[:, CANONICAL_BAR_COLUMNS]
             frames.append(frame)
 
